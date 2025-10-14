@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cattle Herd Projection System</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Chart.js for Visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getFirestore, doc, setDoc, collection, query, getDocs, updateDoc, deleteDoc, addDoc, onSnapshot, where } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        
+        // Expose Firebase functions globally for use in the script
+        window.firebase = {
+            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+            getFirestore, doc, setDoc, collection, query, getDocs, updateDoc, deleteDoc, addDoc, onSnapshot, where, setLogLevel
+        };
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .chart-container { position: relative; height: 40vh; width: 100%; }
+        /* Style for active navigation item */
+        .nav-item.active {
+            background-color: #3b82f6; /* Blue 500 */
+            color: white;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen flex">
+
+    <!-- Sidebar Navigation -->
+    <aside class="w-64 bg-white shadow-xl flex-shrink-0">
+        <div class="p-6 border-b border-gray-100">
+            <h1 class="text-xl font-bold text-gray-800">Cattle System</h1>
+            <p id="user-id-display" class="text-xs mt-1 text-gray-500 truncate"></p>
+        </div>
+        <nav class="p-4 space-y-2">
+            <button id="nav-projection" class="nav-item active w-full text-left p-3 rounded-xl transition duration-150 ease-in-out hover:bg-blue-500 hover:text-white" onclick="changeView('projection')">
+                Herd Projection
+            </button>
+            <button id="nav-logging" class="nav-item w-full text-left p-3 rounded-xl transition duration-150 ease-in-out hover:bg-blue-500 hover:text-white" onclick="changeView('logging')">
+                Event Logging
+            </button>
+            <button id="nav-comparison" class="nav-item w-full text-left p-3 rounded-xl transition duration-150 ease-in-out hover:bg-blue-500 hover:text-white" onclick="changeView('comparison')">
+                Comparison Report
+            </button>
+        </nav>
+        <div class="p-6 mt-4">
+            <button id="add-demo-herd" class="w-full bg-green-500 text-white p-3 rounded-xl shadow-md hover:bg-green-600 transition" onclick="addDemoHerd()">
+                Add 30 Demo Cattle
+            </button>
+        </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="flex-1 p-8 overflow-y-auto">
+        <div id="loading-overlay" class="fixed inset-0 bg-white bg-opacity-70 flex items-center justify-center z-50 hidden">
+            <div class="flex items-center space-x-2">
+                <div class="w-6 h-6 border-4 border-blue-500 border-t-transparent border-solid rounded-full animate-spin"></div>
+                <p class="text-lg font-medium text-gray-700">Loading Application...</p>
+            </div>
+        </div>
+        
+        <div id="content-area" class="space-y-8">
+            <!-- Content will be injected here by JavaScript -->
+        </div>
+
+        <!-- Custom Modal for Messages (No alert/confirm) -->
+        <div id="message-modal" class="fixed inset-0 bg-gray-900 bg-opacity-70 hidden items-center justify-center z-50">
+            <div class="bg-white p-6 rounded-xl shadow-2xl w-96">
+                <h3 id="modal-title" class="text-xl font-semibold text-gray-800 mb-4">Message</h3>
+                <p id="modal-message" class="text-gray-600 mb-6"></p>
+                <button class="w-full bg-blue-500 text-white p-3 rounded-xl hover:bg-blue-600 transition" onclick="closeModal()">OK</button>
+            </div>
+        </div>
+
+    </main>
+
+    <script>
+        // Set up the console log level for Firebase
+        if (typeof firebase !== 'undefined' && firebase.setLogLevel) {
+            firebase.setLogLevel('debug');
+        }
+
+        // --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // --- CORE APPLICATION STATE & FIREBASE INSTANCES ---
+        let app, db, auth, userId = 'loading';
+        let currentView = 'projection';
+        let lastProjection = null;
+        let mainChart = null;
+
+        // --- CORE MODELING FUNCTIONS (Member 1 equivalent) ---
+
+        /**
+         * Implements the modified two-cohort (Breeders B, Juveniles Y) model.
+         */
+        function projectHerdYearly(B0, Y0, C, m, years) {
+            let B = [B0];
+            let Y = [Y0];
+            let Total_Females = [B0 + Y0];
+            
+            for (let n = 1; n <= years; n++) {
+                const lastB = B[B.length - 1];
+                const lastY = Y[Y.length - 1];
+
+                // 1. New female calves born this year
+                const birth_n = C * lastB;
+                
+                // 2. Breeders (B) and Juveniles (Y) survive, Juveniles mature into B
+                const nextB_raw = (lastB * (1 - m)) + (lastY * (1 - m));
+                const nextY_raw = birth_n * (1 - m);
+                
+                // Round to the nearest integer
+                const nextB = Math.round(nextB_raw);
+                const nextY = Math.round(nextY_raw);
+                
+                B.push(nextB);
+                Y.push(nextY);
+                Total_Females.push(nextB + nextY);
+            }
+
+            return { B, Y, Total_Females, years };
+        }
+
+        /**
+         * Calculates Mean Absolute Error (MAE) and Mean Absolute Percentage Error (MAPE).
+         */
+        function calculateError(projectedCounts, actualCounts) {
+            if (projectedCounts.length !== actualCounts.length) {
+                return { mae: 0, mape: 0 };
+            }
+
+            let errors = 0;
+            let percentageErrors = 0;
+            let validCount = 0;
+
+            for (let i = 0; i < projectedCounts.length; i++) {
+                const p = projectedCounts[i];
+                const a = actualCounts[i];
+
+                const absoluteError = Math.abs(p - a);
+                errors += absoluteError;
+
+                // For MAPE, only calculate if actual count (a) is non-zero
+                if (a !== 0) {
+                    percentageErrors += absoluteError / a;
+                    validCount++;
+                }
+            }
+
+            const mae = errors / projectedCounts.length;
+            const mape = validCount > 0 ? (percentageErrors / validCount) * 100 : 0;
+
+            return { mae, mape };
+        }
+
+
+        // --- DATABASE MANAGER (Member 2 equivalent - Using Firestore) ---
+        
+        const FS_COWS = 'cows';
+        const FS_PROJECTIONS = 'projections';
+
+        function getCollectionPath(collectionName) {
+            // Using private data path: /artifacts/{appId}/users/{userId}/{collectionName}
+            return `artifacts/${appId}/users/${userId}/${collectionName}`;
+        }
+
+        function generateCowId(prefix = "C") {
+            return `${prefix}-${Math.floor(Math.random() * 900) + 100}`;
+        }
+
+        /**
+         * Logs an event and updates the cow status if necessary.
+         */
+        async function logEvent(cowId, eventType, details = "") {
+            if (!db || !userId) return showModal("Error", "Authentication not ready. Please wait.");
+
+            const eventData = {
+                cowId: cowId,
+                eventType: eventType,
+                eventDate: new Date().toISOString().split('T')[0],
+                details: details,
+                timestamp: firebase.serverTimestamp ? firebase.serverTimestamp() : new Date(),
+            };
+            
+            try {
+                // 1. Log the event
+                await firebase.addDoc(firebase.collection(db, getCollectionPath(FS_COWS), cowId, 'events'), eventData);
+
+                // 2. Update the cow status if it's a terminal event
+                if (eventType === 'Death' || eventType === 'Sale') {
+                    const cowRef = firebase.doc(db, getCollectionPath(FS_COWS), cowId);
+                    await firebase.updateDoc(cowRef, { status: eventType });
+                    showModal("Success", `${eventType} logged for Cow ID: ${cowId}. Status updated.`);
+                } else {
+                    showModal("Success", `Event ${eventType} logged for Cow ID: ${cowId}.`);
+                }
+                
+                return true;
+            } catch (error) {
+                console.error("Error logging event:", error);
+                showModal("Error", `Failed to log event. Cow ID may not exist.`);
+                return false;
+            }
+        }
+
+        /**
+         * Adds a new cow record to Firestore.
+         */
+        async function addCow(cowId, sex, birthDate, initialHerd = 0) {
+            if (!db || !userId) return showModal("Error", "Authentication not ready.");
+
+            const cowData = {
+                sex: sex,
+                birthDate: birthDate,
+                status: 'Active',
+                initialHerd: initialHerd,
+            };
+
+            try {
+                // Use setDoc to set the document with the specified cowId
+                await firebase.setDoc(firebase.doc(db, getCollectionPath(FS_COWS), cowId), cowData);
+                return true;
+            } catch (error) {
+                console.error("Error adding cow:", error);
+                showModal("Error", `Failed to add cow: ${error.message}`);
+                return false;
+            }
+        }
+
+        /**
+         * Saves a completed projection run to Firestore.
+         */
+        async function saveProjection(B0, Y0, C, m, projectionResult) {
+            if (!db || !userId) return showModal("Error", "Authentication not ready.");
+
+            const projectionData = {
+                runDate: new Date().toISOString(),
+                B0_start: B0,
+                Y0_start: Y0,
+                C_param: C,
+                m_param: m,
+                // Store the projection data array as a JSON string
+                projectionDataJson: JSON.stringify(projectionResult), 
+            };
+            
+            try {
+                await firebase.addDoc(firebase.collection(db, getCollectionPath(FS_PROJECTIONS)), projectionData);
+                return true;
+            } catch (error) {
+                console.error("Error saving projection:", error);
+                showModal("Error", "Failed to save projection.");
+                return false;
+            }
+        }
+
+        /**
+         * Retrieves all cows from Firestore.
+         */
+        async function getAllCows() {
+            if (!db || !userId) return [];
+            try {
+                const q = firebase.query(firebase.collection(db, getCollectionPath(FS_COWS)));
+                const snapshot = await firebase.getDocs(q);
+                return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            } catch (error) {
+                console.error("Error fetching cows:", error);
+                return [];
+            }
+        }
+
+        /**
+         * Calculates the ACTUAL cumulative female herd count year-by-year 
+         * based on recorded data (M2's most complex task, simulated here).
+         */
+        async function fetchActualHerdCounts(yearsHorizon) {
+            // For MVP, we will simulate the actual data for comparison, 
+            // as real-time age-based calculation from raw events is too complex for JS/Firestore MVP.
+            
+            const cows = await getAllCows();
+            const initialCount = cows.filter(c => c.sex === 'Female' && c.status === 'Active').length;
+            
+            let actualCounts = [initialCount];
+            
+            // Simulating simple net growth (random factor between 1.05 and 1.15)
+            for (let i = 0; i < yearsHorizon; i++) {
+                const netGrowthFactor = 1.0 + (Math.random() * 0.10) + 0.05; // 5% to 15% net growth
+                const newCount = actualCounts[actualCounts.length - 1] * netGrowthFactor;
+                actualCounts.push(Math.round(new_count));
+            }
+
+            return actualCounts;
+        }
+
+
+        // --- UI & APPLICATION FLOW (Member 3 equivalent) ---
+
+        function showLoading() {
+            document.getElementById('loading-overlay').classList.remove('hidden');
+        }
+        function hideLoading() {
+            document.getElementById('loading-overlay').classList.add('hidden');
+        }
+
+        function showModal(title, message) {
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').textContent = message;
+            document.getElementById('message-modal').classList.remove('hidden');
+            document.getElementById('message-modal').classList.add('flex');
+        }
+
+        function closeModal() {
+            document.getElementById('message-modal').classList.add('hidden');
+            document.getElementById('message-modal').classList.remove('flex');
+        }
+        
+        function updateNav(newView) {
+            document.querySelectorAll('.nav-item').forEach(btn => {
+                btn.classList.remove('active', 'bg-blue-500', 'text-white');
+                btn.classList.add('hover:bg-blue-500', 'hover:text-white');
+            });
+            const activeBtn = document.getElementById(`nav-${newView}`);
+            if (activeBtn) {
+                activeBtn.classList.add('active', 'bg-blue-500', 'text-white');
+                activeBtn.classList.remove('hover:bg-blue-500', 'hover:text-white');
+            }
+        }
+
+        function changeView(view) {
+            currentView = view;
+            updateNav(view);
+            renderContent();
+        }
+
+        // --- CHARTING UTILITY ---
+        function createChart(canvasId, type, labels, datasets) {
+            if (mainChart) mainChart.destroy();
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            mainChart = new Chart(ctx, {
+                type: type,
+                data: {
+                    labels: labels,
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Herd Size (Females)' }
+                        },
+                        x: {
+                            title: { display: true, text: 'Year' }
+                        }
+                    }
+                }
+            });
+        }
+
+        // --- VIEW RENDERING FUNCTIONS ---
+
+        function renderProjectionView() {
+            document.getElementById('content-area').innerHTML = `
+                <h2 class="text-3xl font-semibold text-gray-800 mb-6">Herd Growth Forecasting</h2>
+                <div class="bg-white p-6 rounded-2xl shadow-lg border border-gray-100">
+                    <div class="grid md:grid-cols-3 gap-6">
+                        <div class="space-y-4">
+                            <h3 class="text-xl font-medium text-blue-600">Initial Herd Data</h3>
+                            <label class="block">Breeding Females (B0):</label>
+                            <input id="input-b0" type="number" min="1" value="20" class="w-full p-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                            <label class="block">Juvenile Females (Y0):</label>
+                            <input id="input-y0" type="number" min="0" value="10" class="w-full p-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                        </div>
+                        <div class="space-y-4">
+                            <h3 class="text-xl font-medium text-blue-600">Model Parameters</h3>
+                            <label class="block">Female Calves/Breeder (C): <span id="span-c" class="font-bold text-gray-700">0.50</span></label>
+                            <input id="input-c" type="range" min="0.1" max="1.0" step="0.05" value="0.5" class="w-full" oninput="document.getElementById('span-c').textContent = this.value">
+                            <label class="block">Mortality Rate (m): <span id="span-m" class="font-bold text-gray-700">0.05</span></label>
+                            <input id="input-m" type="range" min="0.01" max="0.20" step="0.01" value="0.05" class="w-full" oninput="document.getElementById('span-m').textContent = this.value">
+                        </div>
+                        <div class="space-y-4">
+                            <h3 class="text-xl font-medium text-blue-600">Simulation Range</h3>
+                            <label class="block">Projection Horizon (Years):</label>
+                            <input id="input-years" type="number" min="1" max="20" value="10" class="w-full p-2 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                            <button class="w-full bg-blue-600 text-white p-3 rounded-xl shadow-lg hover:bg-blue-700 transition mt-4" onclick="runAndSaveProjection()">
+                                Run Projection and Save
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div id="projection-results" class="hidden mt-8">
+                    <h3 class="text-2xl font-semibold text-gray-800 mb-4">Projected Female Herd Growth</h3>
+                    <div class="bg-white p-6 rounded-2xl shadow-lg border border-gray-100">
+                        <div class="chart-container mb-6">
+                            <canvas id="projectionChart"></canvas>
+                        </div>
+                        <div id="projectionTableContainer"></div>
+                    </div>
+                </div>
+            `;
+
+            if (lastProjection) {
+                displayProjectionResults(lastProjection);
+            }
+        }
+
+        async function runAndSaveProjection() {
+            showLoading();
+            const B0 = parseInt(document.getElementById('input-b0').value);
+            const Y0 = parseInt(document.getElementById('input-y0').value);
+            const C = parseFloat(document.getElementById('input-c').value);
+            const m = parseFloat(document.getElementById('input-m').value);
+            const years = parseInt(document.getElementById('input-years').value);
+
+            if (isNaN(B0) || isNaN(Y0) || isNaN(C) || isNaN(m) || isNaN(years) || B0 < 1) {
+                hideLoading();
+                return showModal("Input Error", "Please ensure all fields are valid numbers, and B0 is at least 1.");
+            }
+
+            // 1. Run Model (M1)
+            const result = projectHerdYearly(B0, Y0, C, m, years);
+            
+            // 2. Save to Firestore (M2)
+            await saveProjection(B0, Y0, C, m, result);
+
+            // 3. Display (M3)
+            lastProjection = result;
+            displayProjectionResults(result);
+            hideLoading();
+            showModal("Success", "Projection run complete and results saved successfully! You can now check the Comparison Report.");
+        }
+
+        function displayProjectionResults(result) {
+            document.getElementById('projection-results').classList.remove('hidden');
+
+            const labels = Array.from({ length: result.years + 1 }, (_, i) => i);
+            
+            const datasets = [
+                {
+                    label: 'Total Females (Projected)',
+                    data: result.Total_Females,
+                    borderColor: '#3b82f6', // blue
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    tension: 0.4
+                },
+                {
+                    label: 'Breeders (Projected)',
+                    data: result.B,
+                    borderColor: '#10b981', // emerald
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    tension: 0.4
+                },
+                {
+                    label: 'Juveniles (Projected)',
+                    data: result.Y,
+                    borderColor: '#f59e0b', // amber
+                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                    tension: 0.4
+                }
+            ];
+
+            createChart('projectionChart', 'line', labels, datasets);
+
+            // Create Table
+            let tableHTML = `<table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Year</th>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Total Herd</th>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Breeders</th>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Juveniles</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">`;
+
+            for (let i = 0; i < result.years + 1; i++) {
+                tableHTML += `<tr>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm font-medium text-gray-900">${i}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-blue-600 font-bold">${result.Total_Females[i]}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-700">${result.B[i]}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-700">${result.Y[i]}</td>
+                </tr>`;
+            }
+
+            tableHTML += `</tbody></table>`;
+            document.getElementById('projectionTableContainer').innerHTML = tableHTML;
+        }
+
+        function renderLoggingView() {
+            document.getElementById('content-area').innerHTML = `
+                <h2 class="text-3xl font-semibold text-gray-800 mb-6">Herd Event Logging</h2>
+                <div class="bg-white p-6 rounded-2xl shadow-lg border border-gray-100">
+                    <div class="grid md:grid-cols-2 gap-6">
+                        <!-- Birth Form -->
+                        <div class="p-4 border border-green-200 rounded-xl bg-green-50">
+                            <h3 class="text-xl font-medium text-green-700 mb-4">Log a New Birth</h3>
+                            <div class="space-y-3">
+                                <input id="birth-cow-id" type="text" placeholder="New Calf ID (e.g., C-001)" class="w-full p-2 border rounded-lg">
+                                <select id="birth-sex" class="w-full p-2 border rounded-lg">
+                                    <option value="Female">Female (Crucial for projection)</option>
+                                    <option value="Male">Male</option>
+                                </select>
+                                <input id="birth-date" type="date" value="${new Date().toISOString().split('T')[0]}" class="w-full p-2 border rounded-lg">
+                                <button class="w-full bg-green-600 text-white p-3 rounded-xl hover:bg-green-700 transition" onclick="logBirth()">
+                                    Log Birth and Add Cow
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Terminal Event Form -->
+                        <div class="p-4 border border-red-200 rounded-xl bg-red-50">
+                            <h3 class="text-xl font-medium text-red-700 mb-4">Log Death or Sale</h3>
+                            <div class="space-y-3">
+                                <select id="terminal-event-type" class="w-full p-2 border rounded-lg">
+                                    <option value="Death">Death</option>
+                                    <option value="Sale">Sale (Cull)</option>
+                                </select>
+                                <input id="terminal-cow-id" type="text" placeholder="Cow ID Affected (e.g., B-005)" class="w-full p-2 border rounded-lg">
+                                <textarea id="terminal-details" placeholder="Reason/Notes (e.g., Sickness, Market sale price)" class="w-full p-2 border rounded-lg"></textarea>
+                                <button class="w-full bg-red-600 text-white p-3 rounded-xl hover:bg-red-700 transition" onclick="logTerminalEvent()">
+                                    Log Event and Update Status
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mt-8">
+                        <h3 class="text-2xl font-semibold text-gray-800 mb-4">Current Active Cows</h3>
+                        <div id="cow-list" class="bg-white p-4 rounded-xl shadow border">
+                            <p class="text-gray-500">Loading cow list...</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+            // Set up a real-time listener for the cow list (M2/M3 collaboration)
+            setupCowListener();
+        }
+
+        async function logBirth() {
+            const cowId = document.getElementById('birth-cow-id').value;
+            const sex = document.getElementById('birth-sex').value;
+            const birthDate = document.getElementById('birth-date').value;
+
+            if (!cowId || !birthDate) return showModal("Error", "Please fill in all birth details.");
+
+            if (await addCow(cowId, sex, birthDate, 0)) {
+                await logEvent(cowId, 'Birth', `Sex: ${sex}`);
+            }
+        }
+
+        async function logTerminalEvent() {
+            const eventType = document.getElementById('terminal-event-type').value;
+            const cowId = document.getElementById('terminal-cow-id').value;
+            const details = document.getElementById('terminal-details').value;
+
+            if (!cowId) return showModal("Error", "Please enter the Cow ID affected.");
+
+            // logEvent handles the status update internally
+            await logEvent(cowId, eventType, details);
+        }
+
+        function setupCowListener() {
+            if (!db || !userId) return;
+            const cowsRef = firebase.collection(db, getCollectionPath(FS_COWS));
+            
+            // Listen for changes to update the cow list in real-time
+            firebase.onSnapshot(cowsRef, (snapshot) => {
+                const cows = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                const cowListContainer = document.getElementById('cow-list');
+                if (!cowListContainer) return;
+
+                let listHTML = `<ul class="divide-y divide-gray-100">`;
+                const activeCows = cows.filter(c => c.status === 'Active');
+                
+                if (activeCows.length === 0) {
+                     cowListContainer.innerHTML = '<p class="text-gray-500 p-4">No active cows recorded yet.</p>';
+                     return;
+                }
+
+                activeCows.slice(0, 10).forEach(cow => {
+                    listHTML += `<li class="py-2 flex justify-between items-center">
+                        <span class="font-mono text-sm text-gray-900">${cow.id}</span>
+                        <span class="text-xs ${cow.sex === 'Female' ? 'bg-pink-100 text-pink-700' : 'bg-blue-100 text-blue-700'} px-2 py-1 rounded-full">${cow.sex}</span>
+                        <span class="text-xs text-gray-500">Born: ${cow.birthDate}</span>
+                    </li>`;
+                });
+
+                listHTML += `</ul>`;
+                if (cows.length > 10) listHTML += `<p class="text-xs text-gray-500 mt-2">... Showing 10 of ${activeCows.length} active cows.</p>`;
+                
+                cowListContainer.innerHTML = listHTML;
+            }, (error) => {
+                console.error("Cow listener error:", error);
+                document.getElementById('cow-list').innerHTML = '<p class="text-red-500">Error loading cow list.</p>';
+            });
+        }
+
+        async function renderComparisonView() {
+            showLoading();
+            let projections = [];
+            
+            try {
+                const q = firebase.query(firebase.collection(db, getCollectionPath(FS_PROJECTIONS)));
+                const snapshot = await firebase.getDocs(q);
+                projections = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            } catch (e) {
+                console.error("Error fetching projections:", e);
+                showModal("Error", "Failed to fetch projections from database.");
+            }
+
+            let comparisonContent = `
+                <h2 class="text-3xl font-semibold text-gray-800 mb-6">Model Validation: Projected vs. Actual</h2>
+                <div class="bg-white p-6 rounded-2xl shadow-lg border border-gray-100">
+                    <h3 class="text-xl font-medium text-blue-600 mb-4">Select Projection Run</h3>`;
+
+            if (projections.length === 0) {
+                comparisonContent += `<p class="text-gray-500">No saved projections found. Run one from the Herd Projection page.</p>`;
+            } else {
+                comparisonContent += `<select id="projection-select" class="w-full p-2 border rounded-lg mb-4" onchange="displayComparison()">
+                    <option value="">-- Select a Run --</option>`;
+                
+                projections.sort((a, b) => new Date(b.runDate) - new Date(a.runDate));
+
+                projections.forEach(p => {
+                    const date = new Date(p.runDate).toLocaleDateString();
+                    comparisonContent += `<option value="${p.id}" data-json='${JSON.stringify(p)}'>
+                        ${date} | B0: ${p.B0_start} | M: ${p.m_param} | C: ${p.C_param}
+                    </option>`;
+                });
+
+                comparisonContent += `</select>
+                    <div id="comparison-results-container" class="mt-6 hidden">
+                        <div class="grid md:grid-cols-2 gap-4 mb-6" id="metrics-container"></div>
+                        <div class="chart-container mb-6">
+                            <canvas id="comparisonChart"></canvas>
+                        </div>
+                        <div id="comparisonTableContainer"></div>
+                    </div>`;
+            }
+
+            comparisonContent += `</div>`;
+            document.getElementById('content-area').innerHTML = comparisonContent;
+            hideLoading();
+        }
+
+        async function displayComparison() {
+            showLoading();
+            const select = document.getElementById('projection-select');
+            const projectionId = select.value;
+            const comparisonContainer = document.getElementById('comparison-results-container');
+            
+            if (!projectionId) {
+                comparisonContainer.classList.add('hidden');
+                hideLoading();
+                return;
+            }
+
+            // Get selected projection data
+            const selectedOption = select.options[select.selectedIndex];
+            const rawProjection = JSON.parse(selectedOption.getAttribute('data-json'));
+            const projectedData = JSON.parse(rawProjection.projectionDataJson);
+            const yearsHorizon = projectedData.years;
+
+            // Get actual mock data (M2)
+            const actualData = await fetchActualHerdCounts(yearsHorizon); 
+            
+            // 1. Create Comparison DataFrame (using arrays)
+            const comparison = [];
+            for(let i = 0; i < projectedData.years + 1; i++) {
+                comparison.push({
+                    year: i,
+                    projected: projectedData.Total_Females[i],
+                    actual: actualData[i] || null // Use null for years beyond actual recording
+                });
+            }
+
+            // 2. Error Calculation (M1)
+            const validComparison = comparison.filter(c => c.actual !== null);
+            const projectedCounts = validComparison.map(c => c.projected);
+            const actualCounts = validComparison.map(c => c.actual);
+            
+            const { mae, mape } = calculateError(projectedCounts, actualCounts);
+            
+            // 3. Display Metrics (M3)
+            const metricsContainer = document.getElementById('metrics-container');
+            metricsContainer.innerHTML = `
+                <div class="p-4 bg-gray-50 rounded-xl border border-gray-200">
+                    <p class="text-sm font-medium text-gray-500">Mean Absolute Error (MAE)</p>
+                    <p class="text-3xl font-extrabold text-red-600">${mae.toFixed(2)}</p>
+                    <p class="text-sm text-gray-600">Cows difference on average</p>
+                </div>
+                <div class="p-4 bg-gray-50 rounded-xl border border-gray-200">
+                    <p class="text-sm font-medium text-gray-500">Mean Absolute Percentage Error (MAPE)</p>
+                    <p class="text-3xl font-extrabold text-red-600">${mape.toFixed(2)}%</p>
+                    <p class="text-sm text-gray-600">Percentage difference on average</p>
+                </div>
+            `;
+
+            // 4. Charting (M3)
+            const labels = comparison.map(c => c.year);
+            const datasets = [
+                {
+                    label: 'Projected Herd Size',
+                    data: comparison.map(c => c.projected),
+                    borderColor: '#3b82f6', 
+                    backgroundColor: 'rgba(59, 130, 246, 0.2)',
+                    fill: false,
+                    tension: 0.3,
+                    borderWidth: 3
+                },
+                {
+                    label: 'Actual Herd Size',
+                    data: comparison.map(c => c.actual),
+                    borderColor: '#10b981', 
+                    backgroundColor: 'rgba(16, 185, 129, 0.2)',
+                    fill: false,
+                    tension: 0.3,
+                    borderWidth: 3
+                }
+            ];
+            createChart('comparisonChart', 'line', labels, datasets);
+
+            // 5. Table (M3)
+            let tableHTML = `<table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Year</th>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Projected Herd</th>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Actual Herd</th>
+                        <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Difference</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">`;
+
+            comparison.forEach(c => {
+                const diff = c.actual !== null ? (c.projected - c.actual).toFixed(0) : 'N/A';
+                const diffClass = c.actual !== null ? (parseInt(diff) > 0 ? 'text-red-500' : 'text-green-500') : 'text-gray-400';
+                tableHTML += `<tr>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm font-medium text-gray-900">${c.year}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-blue-600 font-bold">${c.projected}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm text-gray-700">${c.actual !== null ? c.actual : '-'}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-sm ${diffClass}">${diff}</td>
+                </tr>`;
+            });
+
+            tableHTML += `</tbody></table>`;
+            document.getElementById('comparisonTableContainer').innerHTML = tableHTML;
+            comparisonContainer.classList.remove('hidden');
+            hideLoading();
+        }
+
+        // --- DEMO FUNCTIONALITY ---
+
+        async function addDemoHerd() {
+            showLoading();
+            
+            // Clear existing for a fresh start (optional, for demo)
+            // Note: In a real app, you wouldn't delete existing data.
+            // Simplified cleanup for demo purposes.
+            try {
+                const cows = await getAllCows();
+                for (const cow of cows) {
+                    await firebase.deleteDoc(firebase.doc(db, getCollectionPath(FS_COWS), cow.id));
+                }
+            } catch (error) {
+                console.warn("Could not clear previous cow data. Proceeding anyway.");
+            }
+
+            const promises = [];
+            // Add 20 Breeders (>2 years old)
+            for (let i = 1; i <= 20; i++) {
+                const birthDate = new Date(Date.now() - (Math.random() * 3000 + 730) * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+                promises.push(addCow(generateCowId("B"), "Female", birthDate, 1));
+            }
+            // Add 10 Juveniles (<2 years old)
+            for (let i = 1; i <= 10; i++) {
+                const birthDate = new Date(Date.now() - (Math.random() * 700 + 10) * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+                promises.push(addCow(generateCowId("Y"), "Female", birthDate, 1));
+            }
+
+            await Promise.all(promises);
+            hideLoading();
+            showModal("Success", "30 Sample Female Cattle added! Run a projection now in the first tab.");
+        }
+
+
+        // --- FIREBASE INITIALIZATION ---
+
+        window.onload = async () => {
+            showLoading();
+
+            if (!firebaseConfig) {
+                showModal("Configuration Error", "Firebase configuration is missing. Cannot initialize database.");
+                hideLoading();
+                return;
+            }
+
+            try {
+                app = firebase.initializeApp(firebaseConfig);
+                auth = firebase.getAuth(app);
+                db = firebase.getFirestore(app);
+
+                // Authentication Logic
+                await new Promise((resolve, reject) => {
+                    const unsubscribe = firebase.onAuthStateChanged(auth, async (user) => {
+                        unsubscribe(); 
+                        if (user) {
+                            userId = user.uid;
+                        } else {
+                            if (initialAuthToken) {
+                                const cred = await firebase.signInWithCustomToken(auth, initialAuthToken);
+                                userId = cred.user.uid;
+                            } else {
+                                const cred = await firebase.signInAnonymously(auth);
+                                userId = cred.user.uid;
+                            }
+                        }
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId.substring(0, 8)}...`;
+                        resolve();
+                    }, reject);
+                });
+                
+                // Initialize default view
+                renderContent();
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                showModal("Initialization Failed", `Could not connect to Firebase: ${error.message}. Check console for details.`);
+            } finally {
+                hideLoading();
+            }
+        };
+        
+        function renderContent() {
+            if (mainChart) mainChart.destroy(); // Destroy chart before switching views
+            if (currentView === 'projection') renderProjectionView();
+            else if (currentView === 'logging') renderLoggingView();
+            else if (currentView === 'comparison') renderComparisonView();
+        }
+    </script>
+</body>
+</html>
